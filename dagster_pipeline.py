@@ -44,7 +44,7 @@ def _price_to_uzs(amount: float | None, currency: str | None, usd_to_uzs_rate: f
 
 
 def _listing_area_text(listing: OlxListing) -> str:
-    param_values = [param.value for param in listing.params if param.value]
+    param_values = [str(param.value) for param in listing.params if param.value is not None]
     return " ".join([listing.title, *param_values]).strip()
 
 

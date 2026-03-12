@@ -14,7 +14,7 @@ from olx_client import OlxListing
 
 
 def test_fetch_raw_olx_data_collects_pydantic_listings(monkeypatch) -> None:
-    async def fake_fetch_category_listings(category_url: str | None, max_pages: int, *, category_id: int | None = None):
+    async def mock_fetch_category_listings(category_url: str | None, max_pages: int, *, category_id: int | None = None):
         assert category_url == "https://www.olx.uz/nedvizhimost/kvartiry/"
         assert max_pages == 2
         assert category_id == 1147
@@ -28,7 +28,7 @@ def test_fetch_raw_olx_data_collects_pydantic_listings(monkeypatch) -> None:
             }
         )
 
-    monkeypatch.setattr("dagster_pipeline.fetch_category_listings", fake_fetch_category_listings)
+    monkeypatch.setattr("dagster_pipeline.fetch_category_listings", mock_fetch_category_listings)
 
     listings = asyncio.run(
         fetch_raw_olx_data(
