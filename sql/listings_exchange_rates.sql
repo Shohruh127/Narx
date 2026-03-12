@@ -62,6 +62,13 @@ CREATE TABLE listings (
     )
 ) PARTITION BY LIST (status);
 
+COMMENT ON COLUMN listings.id IS
+    'UUIDv7 identifier; the primary key also includes partition columns because PostgreSQL requires partition keys in UNIQUE/PRIMARY KEY constraints on partitioned tables.';
+
+CREATE TABLE listing_id_registry (
+    id uuid PRIMARY KEY
+);
+
 CREATE TABLE listings_active
     PARTITION OF listings
     FOR VALUES IN ('active')
@@ -82,6 +89,13 @@ CREATE TABLE exchange_rates (
     CONSTRAINT exchange_rates_pk PRIMARY KEY (id, status, created_at),
     CONSTRAINT exchange_rates_currency_code_chk CHECK (currency_code = upper(currency_code))
 ) PARTITION BY LIST (status);
+
+COMMENT ON COLUMN exchange_rates.id IS
+    'UUIDv7 identifier; the primary key also includes partition columns because PostgreSQL requires partition keys in UNIQUE/PRIMARY KEY constraints on partitioned tables.';
+
+CREATE TABLE exchange_rate_id_registry (
+    id uuid PRIMARY KEY
+);
 
 CREATE TABLE exchange_rates_active
     PARTITION OF exchange_rates
@@ -132,11 +146,46 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION reserve_partitioned_uuid()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF TG_OP = 'UPDATE' AND NEW.id <> OLD.id THEN
+        RAISE EXCEPTION '% id cannot be updated after insert', TG_TABLE_NAME
+            USING ERRCODE = 'feature_not_supported';
+    END IF;
+
+    IF TG_OP = 'INSERT' THEN
+        BEGIN
+            EXECUTE format('INSERT INTO %I (id) VALUES ($1)', TG_ARGV[0])
+            USING NEW.id;
+        EXCEPTION
+            WHEN unique_violation THEN
+                RAISE EXCEPTION '% already contains id %', TG_TABLE_NAME, NEW.id
+                    USING ERRCODE = 'unique_violation';
+        END;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
 SELECT create_monthly_real_estate_partitions(current_date);
 SELECT create_monthly_real_estate_partitions((current_date + interval '1 month')::date);
 
 CREATE INDEX listings_location_gix ON listings USING GIST (location);
 CREATE INDEX listings_created_at_idx ON listings (created_at);
 CREATE INDEX exchange_rates_currency_rate_date_idx ON exchange_rates (currency_code, rate_date DESC);
+
+CREATE TRIGGER listings_global_id_uniqueness_trg
+BEFORE INSERT OR UPDATE OF id ON listings
+FOR EACH ROW
+EXECUTE FUNCTION reserve_partitioned_uuid('listing_id_registry');
+
+CREATE TRIGGER exchange_rates_global_id_uniqueness_trg
+BEFORE INSERT OR UPDATE OF id ON exchange_rates
+FOR EACH ROW
+EXECUTE FUNCTION reserve_partitioned_uuid('exchange_rate_id_registry');
 
 COMMIT;
