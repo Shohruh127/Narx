@@ -17,6 +17,8 @@ from dagster_pipeline import (
 )
 from olx_client import OlxListing
 
+NUM_SUCCESSFUL_OLX_IDS = 25
+
 
 def test_fetch_raw_olx_data_collects_pydantic_listings(monkeypatch) -> None:
     async def mock_fetch_category_listings(category_url: str | None, max_pages: int, *, category_id: int | None = None):
@@ -201,7 +203,7 @@ def test_find_deactivated_olx_source_ids_retries_429_and_limits_concurrency() ->
         return httpx.Response(200, json={"data": {"id": source_id}})
 
     async def run_check() -> list[str]:
-        source_ids = [str(index) for index in range(25)] + ["404-after-429"]
+        source_ids = [str(index) for index in range(NUM_SUCCESSFUL_OLX_IDS)] + ["404-after-429"]
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             return await find_deactivated_olx_source_ids(
                 source_ids,
@@ -213,6 +215,7 @@ def test_find_deactivated_olx_source_ids_retries_429_and_limits_concurrency() ->
 
     assert deactivated_ids == ["404-after-429"]
     assert attempts_by_id["404-after-429"] == 2
+    assert all(str(index) not in deactivated_ids for index in range(NUM_SUCCESSFUL_OLX_IDS))
     assert max_active_requests <= 15
 
 

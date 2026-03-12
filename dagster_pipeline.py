@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable
+import logging
 
 import asyncpg
 import httpx
@@ -38,6 +39,8 @@ DEACTIVATE_OLX_LISTINGS_QUERY = """
 OLX_OFFER_API_URL = "https://www.olx.uz/api/v1/offers"
 OLX_CHECK_CONCURRENCY = 15
 OLX_CHECK_RETRY_WAIT: wait_base = wait_exponential(multiplier=1, min=1, max=8)
+ASYNC_PG_UPDATE_TAG_FORMAT = 'Expected format: "UPDATE <count>".'
+LOGGER = logging.getLogger(__name__)
 
 
 class OLXPipelineConfig(ConfigurableResource):
@@ -50,7 +53,7 @@ class OLXPipelineConfig(ConfigurableResource):
     usd_to_uzs_rate: float | None = None
 
 
-class OLXRateLimitError(Exception):
+class OLXRetryableStatusError(Exception):
     pass
 
 
@@ -156,13 +159,14 @@ async def check_olx_listing_is_deactivated(
     *,
     client: httpx.AsyncClient,
     semaphore: asyncio.Semaphore,
-    retry_wait: wait_base = OLX_CHECK_RETRY_WAIT,
+    retry_wait: wait_base | None = None,
 ) -> bool:
+    resolved_retry_wait = retry_wait or OLX_CHECK_RETRY_WAIT
     try:
         async for attempt in AsyncRetrying(
-            retry=retry_if_exception_type((OLXRateLimitError, httpx.TransportError)),
+            retry=retry_if_exception_type((OLXRetryableStatusError, httpx.TransportError)),
             stop=stop_after_attempt(3),
-            wait=retry_wait,
+            wait=resolved_retry_wait,
             reraise=True,
         ):
             with attempt:
@@ -171,13 +175,14 @@ async def check_olx_listing_is_deactivated(
                 if response.status_code == 404:
                     return True
                 if response.status_code == 429:
-                    raise OLXRateLimitError(source_id)
+                    raise OLXRetryableStatusError(source_id)
+                if 500 <= response.status_code < 600:
+                    raise OLXRetryableStatusError(source_id)
                 response.raise_for_status()
                 return False
-    except (OLXRateLimitError, httpx.HTTPError):
+    except (OLXRetryableStatusError, httpx.HTTPError):
+        LOGGER.warning("Skipping OLX status deactivation check for source_id=%s", source_id, exc_info=True)
         return False
-
-    return False
 
 
 async def find_deactivated_olx_source_ids(
@@ -185,22 +190,43 @@ async def find_deactivated_olx_source_ids(
     *,
     client: httpx.AsyncClient,
     concurrency: int = OLX_CHECK_CONCURRENCY,
-    retry_wait: wait_base = OLX_CHECK_RETRY_WAIT,
+    retry_wait: wait_base | None = None,
 ) -> list[str]:
     semaphore = asyncio.Semaphore(concurrency)
+    resolved_retry_wait = retry_wait or OLX_CHECK_RETRY_WAIT
 
     async def check_source_id(source_id: str) -> str | None:
         if await check_olx_listing_is_deactivated(
             source_id,
             client=client,
             semaphore=semaphore,
-            retry_wait=retry_wait,
+            retry_wait=resolved_retry_wait,
         ):
             return source_id
         return None
 
     results = await asyncio.gather(*(check_source_id(source_id) for source_id in source_ids))
     return [source_id for source_id in results if source_id is not None]
+
+
+def _parse_updated_rows(command: str) -> int:
+    operation, _, raw_count = command.partition(" ")
+    if operation != "UPDATE":
+        raise ValueError(
+            f"Unexpected asyncpg command tag: {command!r}. "
+            f"{ASYNC_PG_UPDATE_TAG_FORMAT}"
+        )
+    if not raw_count:
+        raise ValueError(
+            f"Missing updated row count in asyncpg command tag: {command!r}. "
+            f"{ASYNC_PG_UPDATE_TAG_FORMAT}"
+        )
+    if not raw_count.isdigit():
+        raise ValueError(
+            f"Unexpected asyncpg command tag: {command!r}. "
+            f"{ASYNC_PG_UPDATE_TAG_FORMAT}"
+        )
+    return int(raw_count)
 
 
 async def deactivate_olx_source_ids(source_ids: list[str], *, postgres_dsn: str) -> int:
@@ -213,7 +239,7 @@ async def deactivate_olx_source_ids(source_ids: list[str], *, postgres_dsn: str)
     finally:
         await connection.close()
 
-    return int(command.split()[-1])
+    return _parse_updated_rows(command)
 
 
 async def load_dataframe_to_postgres(dataframe: pd.DataFrame, *, postgres_dsn: str) -> int:
