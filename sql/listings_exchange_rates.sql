@@ -52,6 +52,7 @@ CREATE TABLE listings (
     address_raw text,
     district varchar(120),
     location geometry(Point, 4326),
+    nearest_metro_meters integer,
     geocode_status varchar(20),
     
     -- Meta ma'lumotlar
@@ -74,9 +75,16 @@ CREATE TABLE exchange_rates (
     CONSTRAINT uq_exchange_rates_date UNIQUE (currency_code, rate_date)
 );
 
+CREATE TABLE tashkent_metro_stations (
+    id bigint PRIMARY KEY,
+    name text NOT NULL,
+    location geometry(Point, 4326) NOT NULL
+);
+
 -- 4. Geospatial va Qidiruv Indekslari
 -- PostGIS orqali radius bo'yicha qidiruvni tezlashtirish uchun GiST indeksi.
 CREATE INDEX idx_listings_location ON listings USING GIST (location);
+CREATE INDEX idx_tashkent_metro_stations_location ON tashkent_metro_stations USING GIST (location);
 
 -- Analitika va filterlar uchun B-Tree indekslar
 CREATE INDEX idx_listings_status ON listings (status);
