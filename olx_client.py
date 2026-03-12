@@ -74,7 +74,7 @@ class OlxPrice(BaseModel):
             return data
 
         if data.get("arrange") is True:
-            return {"value": None, "currency": data.get("currency")}
+            return {"value": None, "currency": None}
 
         raw_value = data.get("value", data.get("amount", data.get("price")))
         currency = data.get("currency")
@@ -231,7 +231,12 @@ class AsyncOLXClient:
         if category_id is not None:
             params["category_id"] = category_id
         elif not parsed.path.startswith("/api/"):
-            raise ValueError("category_id is required for non-API OLX category URLs")
+            raise ValueError(
+                "category_id parameter is required when using a category URL. "
+                "Either provide category_id for URLs like "
+                "'https://www.olx.uz/nedvizhimost/kvartiry/' or use an API endpoint URL directly, "
+                "such as 'https://www.olx.uz/api/v1/offers/?category_id=1147'."
+            )
 
         return base_url, params
 

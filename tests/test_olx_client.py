@@ -60,7 +60,7 @@ def test_listing_model_accepts_arranged_and_zero_prices() -> None:
         {
             "id": 202,
             "relative_url": "/d/obyavlenie/arranged-ID202.html",
-            "title": "Kelishiladi",
+            "title": "Negotiable",
             "price": {"arrange": True},
             "params": [],
         }
@@ -83,7 +83,7 @@ def test_listing_model_accepts_arranged_and_zero_prices() -> None:
     assert zero_price.price.currency == "UZS"
 
 
-def test_build_request_uses_category_id_instead_of_path_slug() -> None:
+def test_build_request_uses_category_id_parameter() -> None:
     client = AsyncOLXClient()
 
     try:
@@ -183,7 +183,7 @@ def test_async_client_yields_listings_for_multiple_pages() -> None:
                             "relative_url": "/d/obyavlenie/item-2",
                             "title": "Second",
                             "price": {"value": "2000", "currency": "USD"},
-                            "params": [{"name": "Площадь", "value": {"label": "70 m²"}}],
+                            "params": [{"name": "Площадь", "value": {"label": "70 м²"}}],
                         }
                     ]
                 },
