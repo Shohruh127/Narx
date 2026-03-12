@@ -52,6 +52,7 @@ UPDATE_LISTING_GEOCODE_QUERY = """
     SET
         location = ST_SetSRID(ST_MakePoint($2, $3), 4326),
         district = COALESCE($4, district),
+        nearest_metro_meters = NULL,
         geocode_status = 'geocoded',
         updated_at = CURRENT_TIMESTAMP
     WHERE id = $1
@@ -72,15 +73,16 @@ UPSERT_TASHKENT_METRO_STATIONS_QUERY = """
 UPDATE_NEAREST_METRO_METERS_QUERY = """
     UPDATE listings AS listings
     SET
-        nearest_metro_meters = nearest_metro.distance_meters,
+        nearest_metro_meters = ROUND(ST_DistanceSphere(listings.location, nearest_metro.location))::integer,
         updated_at = CURRENT_TIMESTAMP
     FROM LATERAL (
-        SELECT ROUND(ST_DistanceSphere(listings.location, metro.location))::integer AS distance_meters
+        SELECT metro.location
         FROM tashkent_metro_stations AS metro
-        ORDER BY ST_DistanceSphere(listings.location, metro.location), metro.id
+        ORDER BY listings.location <-> metro.location, metro.id
         LIMIT 1
     ) AS nearest_metro
     WHERE listings.location IS NOT NULL
+      AND listings.nearest_metro_meters IS NULL
 """
 OLX_OFFER_API_URL = "https://www.olx.uz/api/v1/offers"
 OLX_CHECK_CONCURRENCY = 15

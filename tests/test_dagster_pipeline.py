@@ -490,6 +490,7 @@ def test_update_listing_geocode_and_not_found_use_expected_queries() -> None:
 
     assert "ST_SetSRID(ST_MakePoint($2, $3), 4326)" in executed[0][0]
     assert "district = COALESCE($4, district)" in executed[0][0]
+    assert "nearest_metro_meters = NULL" in executed[0][0]
     assert "geocode_status = 'geocoded'" in executed[0][0]
     assert executed[0][1] == ("listing-1", 69.2034, 41.2756, "Chilonzor tumani")
     assert "geocode_status = 'not_found'" in executed[1][0]
@@ -521,9 +522,11 @@ def test_update_listings_nearest_metro_meters_calculates_distances(monkeypatch) 
 
     assert updated_rows == 3
     assert executed["dsn"] == "postgresql://user:pass@localhost:5432/narx"
-    assert "nearest_metro_meters = nearest_metro.distance_meters" in executed["query"]
-    assert "ST_DistanceSphere(listings.location, metro.location)" in executed["query"]
+    assert "nearest_metro_meters = ROUND(ST_DistanceSphere(listings.location, nearest_metro.location))::integer" in executed["query"]
+    assert "ST_DistanceSphere(listings.location, nearest_metro.location)" in executed["query"]
+    assert "ORDER BY listings.location <-> metro.location, metro.id" in executed["query"]
     assert "FROM tashkent_metro_stations AS metro" in executed["query"]
+    assert "listings.nearest_metro_meters IS NULL" in executed["query"]
     assert executed["closed"] is True
 
 
