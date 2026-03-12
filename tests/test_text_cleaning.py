@@ -20,9 +20,9 @@ def test_parse_area_house_recognizes_m2_alias() -> None:
     assert result["land_area_sotix"] is None
 
 
-def test_parse_area_apartment_uses_first_number_as_living_area() -> None:
+def test_parse_area_apartment_prefers_likely_area_number() -> None:
     result = parse_area("3 xonali, 78.5", "apartment")
-    assert result["living_area_m2"] == 3.0
+    assert result["living_area_m2"] == 78.5
     assert result["land_area_sotix"] is None
 
 
@@ -70,3 +70,15 @@ def test_normalize_price_unknown_currency_returns_none_currency() -> None:
     amount, currency = normalize_price("100000", "eur")
     assert amount == 100000.0
     assert currency is None
+
+
+def test_normalize_price_parses_european_number_format() -> None:
+    amount, currency = normalize_price("1.234,56", "usd")
+    assert amount == 1234.56
+    assert currency == "USD"
+
+
+def test_normalize_price_returns_none_for_malformed_number() -> None:
+    amount, currency = normalize_price("1,234.56.78", "usd")
+    assert amount is None
+    assert currency == "USD"

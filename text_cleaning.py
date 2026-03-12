@@ -15,10 +15,34 @@ def _parse_number(raw_number: str) -> float | None:
         return None
 
     cleaned = value.replace(" ", "")
-    if "," in cleaned and "." in cleaned:
-        cleaned = cleaned.replace(",", "")
-    elif "," in cleaned:
-        cleaned = cleaned.replace(",", ".")
+    if not re.fullmatch(r"[0-9.,]+", cleaned):
+        return None
+
+    comma_count = cleaned.count(",")
+    dot_count = cleaned.count(".")
+
+    if comma_count and dot_count:
+        if cleaned.rfind(",") > cleaned.rfind("."):
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+    elif comma_count:
+        if comma_count > 1:
+            if re.fullmatch(r"\d{1,3}(,\d{3})+", cleaned):
+                cleaned = cleaned.replace(",", "")
+            else:
+                return None
+        else:
+            left, right = cleaned.split(",")
+            if len(right) == 3 and left.isdigit():
+                cleaned = left + right
+            else:
+                cleaned = left + "." + right
+    elif dot_count > 1:
+        if re.fullmatch(r"\d{1,3}(\.\d{3})+", cleaned):
+            cleaned = cleaned.replace(".", "")
+        else:
+            return None
 
     try:
         return float(cleaned)
@@ -45,16 +69,21 @@ def parse_area(text: str, property_type: str) -> dict[str, float | None]:
         return result
 
     if property_kind == "apartment":
-        number_match = _NUMBER_RE.search(text)
-        if number_match:
-            result["living_area_m2"] = _parse_number(number_match.group(0))
+        m2_match = _M2_RE.search(text)
+        if m2_match:
+            result["living_area_m2"] = _parse_number(m2_match.group(1))
+            return result
+
+        number_matches = list(_NUMBER_RE.finditer(text))
+        if number_matches:
+            result["living_area_m2"] = _parse_number(number_matches[-1].group(0))
 
     return result
 
 
 def normalize_price(price_text: str, currency_text: str) -> tuple[float | None, str | None]:
     normalized_currency: str | None = None
-    currency_candidate = f"{currency_text} {price_text}".lower()
+    currency_candidate = " ".join(part for part in [currency_text.strip(), price_text.strip()] if part).lower()
 
     if re.search(r"(у\.?е\.?|\$|\bye\b|\busd\b)", currency_candidate, flags=re.IGNORECASE):
         normalized_currency = "USD"
