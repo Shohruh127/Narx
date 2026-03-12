@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import asyncio
 
+import httpx
 import pandas as pd
+from tenacity import wait_none
 
 from dagster_pipeline import (
     build_listing_upsert_query,
+    deactivate_olx_source_ids,
     clean_listings_dataframe,
+    fetch_active_olx_source_ids,
     fetch_raw_olx_data,
+    find_deactivated_olx_source_ids,
     load_dataframe_to_postgres,
 )
 from olx_client import OlxListing
@@ -145,4 +150,100 @@ def test_load_dataframe_to_postgres_executes_upsert(monkeypatch) -> None:
     assert executed["records"] == [
         ("olx", "22", "apartment", "Test listing", 25000.0, "USD", 312500000.0, None, 65.0, "active")
     ]
+    assert executed["closed"] is True
+
+
+def test_fetch_active_olx_source_ids_reads_only_active_olx_rows(monkeypatch) -> None:
+    executed: dict[str, object] = {}
+
+    class FakeConnection:
+        async def fetch(self, query: str) -> list[dict[str, str]]:
+            executed["query"] = query
+            return [{"source_id": "11"}, {"source_id": "22"}]
+
+        async def close(self) -> None:
+            executed["closed"] = True
+
+    async def fake_connect(dsn: str) -> FakeConnection:
+        executed["dsn"] = dsn
+        return FakeConnection()
+
+    monkeypatch.setattr("dagster_pipeline.asyncpg.connect", fake_connect)
+
+    source_ids = asyncio.run(
+        fetch_active_olx_source_ids(postgres_dsn="postgresql://user:pass@localhost:5432/narx")
+    )
+
+    assert source_ids == ["11", "22"]
+    assert executed["dsn"] == "postgresql://user:pass@localhost:5432/narx"
+    assert "WHERE source = 'olx' AND status = 'active'" in executed["query"]
+    assert executed["closed"] is True
+
+
+def test_find_deactivated_olx_source_ids_retries_429_and_limits_concurrency() -> None:
+    attempts_by_id: dict[str, int] = {}
+    active_requests = 0
+    max_active_requests = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal active_requests, max_active_requests
+        source_id = request.url.path.rsplit("/", maxsplit=1)[-1]
+        attempts_by_id[source_id] = attempts_by_id.get(source_id, 0) + 1
+        active_requests += 1
+        max_active_requests = max(max_active_requests, active_requests)
+        await asyncio.sleep(0.01)
+        active_requests -= 1
+
+        if source_id == "404-after-429" and attempts_by_id[source_id] == 1:
+            return httpx.Response(429, json={"error": "slow down"})
+        if source_id == "404-after-429":
+            return httpx.Response(404, json={"error": "missing"})
+        return httpx.Response(200, json={"data": {"id": source_id}})
+
+    async def run_check() -> list[str]:
+        source_ids = [str(index) for index in range(25)] + ["404-after-429"]
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await find_deactivated_olx_source_ids(
+                source_ids,
+                client=client,
+                retry_wait=wait_none(),
+            )
+
+    deactivated_ids = asyncio.run(run_check())
+
+    assert deactivated_ids == ["404-after-429"]
+    assert attempts_by_id["404-after-429"] == 2
+    assert max_active_requests <= 15
+
+
+def test_deactivate_olx_source_ids_uses_single_bulk_update(monkeypatch) -> None:
+    executed: dict[str, object] = {}
+
+    class FakeConnection:
+        async def execute(self, query: str, source_ids: list[str]) -> str:
+            executed["query"] = query
+            executed["source_ids"] = source_ids
+            return "UPDATE 2"
+
+        async def close(self) -> None:
+            executed["closed"] = True
+
+    async def fake_connect(dsn: str) -> FakeConnection:
+        executed["dsn"] = dsn
+        return FakeConnection()
+
+    monkeypatch.setattr("dagster_pipeline.asyncpg.connect", fake_connect)
+
+    updated_rows = asyncio.run(
+        deactivate_olx_source_ids(
+            ["101", "202"],
+            postgres_dsn="postgresql://user:pass@localhost:5432/narx",
+        )
+    )
+
+    assert updated_rows == 2
+    assert executed["dsn"] == "postgresql://user:pass@localhost:5432/narx"
+    assert "source_id = ANY($1::text[])" in executed["query"]
+    assert "status = 'inactive'" in executed["query"]
+    assert executed["source_ids"] == ["101", "202"]
     assert executed["closed"] is True

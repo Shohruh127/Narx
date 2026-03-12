@@ -4,7 +4,7 @@
 
 `olx_client.py` modulida `httpx.AsyncClient` asosidagi OLX.uz async API klienti bor. U `api/v1/offers/` endpointidan sahifalab ma'lumot oladi, Pydantic V2 modellarida `id`, `url`, `title`, `price`, `params` maydonlarini validate qiladi va `tenacity` orqali 429/403/50x javoblarda 3 marta eksponensial backoff bilan qayta urinadi. So'rovlar mo'rt URL path parsing o'rniga `category_id` orqali quriladi, URL ichidagi query parametrlar esa saqlab qolinadi.
 
-`dagster_pipeline.py` faylida 3 ta Dagster asset bor: `raw_olx_data`, `clean_real_estate_data`, `load_to_postgres`. PostgreSQL ulanish satri hardcode qilinmagan, u `POSTGRES_CONNECTION_STRING` muhit o'zgaruvchisidan Dagster `EnvVar` orqali olinadi va `load_to_postgres` asseti `INSERT ... ON CONFLICT (source, source_id) DO UPDATE` orqali faqat `price_original`, `price_uzs_normalized`, `status`, `updated_at` maydonlarini yangilaydi.
+`dagster_pipeline.py` faylida 4 ta Dagster asset bor: `raw_olx_data`, `clean_real_estate_data`, `load_to_postgres`, `deactivate_deleted_olx_listings`. PostgreSQL ulanish satri hardcode qilinmagan, u `POSTGRES_CONNECTION_STRING` muhit o'zgaruvchisidan Dagster `EnvVar` orqali olinadi; `load_to_postgres` asseti `INSERT ... ON CONFLICT (source, source_id) DO UPDATE` orqali faqat `price_original`, `price_uzs_normalized`, `status`, `updated_at` maydonlarini yangilaydi, yangi deactivation asset esa bazadagi `source = 'olx' AND status = 'active'` e'lonlarni OLX offer API orqali 15 ta parallel GET so'rov bilan tekshirib, 404 bo'lganlarini bitta bulk `UPDATE ... ANY($1::text[])` orqali `inactive` holatiga o'tkazadi.
 
 Bog'liqliklarni o'rnatish:
 
