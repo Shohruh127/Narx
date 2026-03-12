@@ -50,7 +50,9 @@ CREATE TABLE listings (
     
     -- Lokatsiya
     address_raw text,
+    district varchar(120),
     location geometry(Point, 4326),
+    geocode_status varchar(20),
     
     -- Meta ma'lumotlar
     status varchar(20) NOT NULL DEFAULT 'active', -- 'active', 'inactive', 'sold'

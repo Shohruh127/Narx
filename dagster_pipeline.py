@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable
+from dataclasses import dataclass
 import logging
+import re
 
 import asyncpg
 import httpx
@@ -24,6 +26,7 @@ INSERT_COLUMNS = (
     "price_uzs_normalized",
     "land_area_sotix",
     "living_area_m2",
+    "address_raw",
     "status",
 )
 ACTIVE_OLX_SOURCE_IDS_QUERY = """
@@ -36,9 +39,100 @@ DEACTIVATE_OLX_LISTINGS_QUERY = """
     SET status = 'inactive', updated_at = CURRENT_TIMESTAMP
     WHERE source = 'olx' AND status = 'active' AND source_id = ANY($1::text[])
 """
+GEOCODE_CANDIDATES_QUERY = """
+    SELECT id, title, address_raw
+    FROM listings
+    WHERE location IS NULL
+      AND source = 'olx'
+      AND status = 'active'
+      AND COALESCE(geocode_status, '') <> 'not_found'
+"""
+UPDATE_LISTING_GEOCODE_QUERY = """
+    UPDATE listings
+    SET
+        location = ST_SetSRID(ST_MakePoint($2, $3), 4326),
+        district = COALESCE($4, district),
+        geocode_status = 'geocoded',
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = $1
+"""
+MARK_LISTING_GEOCODE_NOT_FOUND_QUERY = """
+    UPDATE listings
+    SET geocode_status = 'not_found', updated_at = CURRENT_TIMESTAMP
+    WHERE id = $1 AND location IS NULL
+"""
 OLX_OFFER_API_URL = "https://www.olx.uz/api/v1/offers"
 OLX_CHECK_CONCURRENCY = 15
 OLX_CHECK_RETRY_WAIT: wait_base = wait_exponential(multiplier=1, min=1, max=8)
+NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search"
+NOMINATIM_HEADERS = {
+    "User-Agent": "NarxDagsterGeocoder/1.0",
+    "Accept-Language": "uz,en",
+}
+NOMINATIM_RATE_LIMIT_SECONDS = 1
+UZBEK_CITY_HINTS = {
+    "tashkent": "Tashkent",
+    "toshkent": "Tashkent",
+    "ташкент": "Tashkent",
+    "samarkand": "Samarkand",
+    "samarqand": "Samarkand",
+    "самарканд": "Samarkand",
+    "bukhara": "Bukhara",
+    "buxoro": "Bukhara",
+    "бухара": "Bukhara",
+    "andijan": "Andijan",
+    "andijon": "Andijan",
+    "андижан": "Andijan",
+    "namangan": "Namangan",
+    "fergana": "Fergana",
+    "fargona": "Fergana",
+    "farg'ona": "Fergana",
+    "фаргана": "Fergana",
+    "qarshi": "Qarshi",
+    "karshi": "Qarshi",
+    "қарши": "Qarshi",
+    "jizzakh": "Jizzakh",
+    "jizzax": "Jizzakh",
+    "gulistan": "Gulistan",
+    "guliston": "Gulistan",
+    "термез": "Termez",
+    "termez": "Termez",
+    "nukus": "Nukus",
+    "ургенч": "Urgench",
+    "urgench": "Urgench",
+    "urganch": "Urgench",
+    "navoi": "Navoi",
+    "navoiy": "Navoi",
+    "xiva": "Khiva",
+    "khiva": "Khiva",
+}
+GEOCODE_TOKEN_PATTERN = re.compile(r"[0-9A-Za-zА-Яа-яЁёЎўҚқҒғҲҳʼ'`-]+")
+GEOCODE_STOPWORDS = frozenset(
+    {
+        "uzbekistan",
+        "o",
+        "ozbekiston",
+        "o'zbekiston",
+        "tashkent",
+        "toshkent",
+        "samarkand",
+        "samarqand",
+        "bukhara",
+        "buxoro",
+        "apartment",
+        "kvartira",
+        "квартира",
+        "uy",
+        "дом",
+        "house",
+        "sale",
+        "rent",
+        "xonali",
+        "комнат",
+        "комната",
+        "room",
+    }
+)
 ASYNC_PG_UPDATE_TAG_FORMAT = 'Expected format: "UPDATE <count>".'
 LOGGER = logging.getLogger(__name__)
 
@@ -57,6 +151,21 @@ class OLXRetryableStatusError(Exception):
     pass
 
 
+@dataclass(frozen=True)
+class ListingGeocodeCandidate:
+    listing_id: str
+    title: str
+    address_raw: str | None
+
+
+@dataclass(frozen=True)
+class ListingGeocodeResult:
+    listing_id: str
+    lon: float
+    lat: float
+    district: str | None
+
+
 def _price_to_uzs(amount: float | None, currency: str | None, usd_to_uzs_rate: float | None) -> float | None:
     if amount is None or currency is None:
         return None
@@ -70,6 +179,19 @@ def _price_to_uzs(amount: float | None, currency: str | None, usd_to_uzs_rate: f
 def _listing_area_text(listing: OlxListing) -> str:
     param_values = [str(param.value) for param in listing.params if param.value is not None]
     return " ".join([listing.title, *param_values]).strip()
+
+
+def _extract_address_from_params(listing: OlxListing) -> str | None:
+    for param in listing.params:
+        normalized_name = param.name.strip().lower()
+        if not any(
+            keyword in normalized_name
+            for keyword in ("располож", "местополож", "адрес", "manzil", "address", "location")
+        ):
+            continue
+        if param.value:
+            return param.value.strip()
+    return None
 
 
 async def fetch_raw_olx_data(
@@ -114,6 +236,7 @@ def clean_listings_dataframe(
                 "price_uzs_normalized": _price_to_uzs(price_original, currency_original, usd_to_uzs_rate),
                 "land_area_sotix": parsed_area["land_area_sotix"],
                 "living_area_m2": parsed_area["living_area_m2"],
+                "address_raw": _extract_address_from_params(listing),
                 "status": default_status,
             }
         )
@@ -129,6 +252,7 @@ def build_listing_upsert_query() -> str:
         VALUES ({placeholders})
         ON CONFLICT (source, source_id) DO UPDATE
         SET
+            address_raw = COALESCE(EXCLUDED.address_raw, listings.address_raw),
             price_original = EXCLUDED.price_original,
             price_uzs_normalized = EXCLUDED.price_uzs_normalized,
             status = EXCLUDED.status,
@@ -152,6 +276,162 @@ async def fetch_active_olx_source_ids(*, postgres_dsn: str) -> list[str]:
         await connection.close()
 
     return [str(row["source_id"]) for row in rows]
+
+
+async def fetch_geocode_candidates(*, postgres_dsn: str) -> list[ListingGeocodeCandidate]:
+    connection = await asyncpg.connect(postgres_dsn)
+    try:
+        rows = await connection.fetch(GEOCODE_CANDIDATES_QUERY)
+    finally:
+        await connection.close()
+
+    return [
+        ListingGeocodeCandidate(
+            listing_id=str(row["id"]),
+            title="" if row["title"] is None else str(row["title"]),
+            address_raw=None if row["address_raw"] is None else str(row["address_raw"]),
+        )
+        for row in rows
+    ]
+
+
+def _detect_city_hint(*texts: str | None) -> str:
+    for text in texts:
+        if not text:
+            continue
+        normalized_text = text.casefold()
+        for variant, city in UZBEK_CITY_HINTS.items():
+            if variant in normalized_text:
+                return city
+    return "Tashkent"
+
+
+def _build_geocode_query_text(candidate: ListingGeocodeCandidate) -> str | None:
+    base_text = (candidate.address_raw or candidate.title).strip()
+    if not base_text:
+        return None
+
+    city = _detect_city_hint(candidate.address_raw, candidate.title)
+    normalized_text = base_text.casefold()
+    parts = [base_text]
+
+    if city.casefold() not in normalized_text:
+        parts.append(city)
+    if "uzbekistan" not in normalized_text and "o'zbekiston" not in normalized_text:
+        parts.append("Uzbekistan")
+
+    return ", ".join(parts)
+
+
+def _tokenize_geocode_text(value: str) -> set[str]:
+    normalized_tokens = set()
+    for match in GEOCODE_TOKEN_PATTERN.findall(value.casefold()):
+        token = match.strip("-'`ʼ")
+        if len(token) < 3 or token in GEOCODE_STOPWORDS:
+            continue
+        normalized_tokens.add(token)
+    return normalized_tokens
+
+
+def _extract_district(result: dict[str, object]) -> str | None:
+    address = result.get("address")
+    if not isinstance(address, dict):
+        return None
+
+    for key in ("city_district", "suburb", "borough", "county", "town", "city"):
+        value = address.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _is_confident_geocode_result(query_text: str, result: dict[str, object]) -> bool:
+    address = result.get("address")
+    if not isinstance(address, dict):
+        return False
+    country_code = address.get("country_code")
+    if isinstance(country_code, str) and country_code.lower() != "uz":
+        return False
+
+    importance = result.get("importance")
+    try:
+        importance_value = float(importance) if isinstance(importance, (int, float, str)) else None
+    except ValueError:
+        importance_value = None
+    if importance_value is not None and importance_value < 0.05:
+        return False
+
+    query_tokens = _tokenize_geocode_text(query_text)
+    if not query_tokens:
+        return False
+
+    display_name = result.get("display_name")
+    if not isinstance(display_name, str):
+        return False
+
+    return bool(query_tokens & _tokenize_geocode_text(display_name))
+
+
+async def geocode_listing_candidate(
+    candidate: ListingGeocodeCandidate,
+    *,
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+) -> ListingGeocodeResult | None:
+    query_text = _build_geocode_query_text(candidate)
+    if query_text is None:
+        return None
+
+    async with semaphore:
+        try:
+            response = await client.get(
+                NOMINATIM_SEARCH_URL,
+                params={
+                    "q": query_text,
+                    "format": "jsonv2",
+                    "limit": 1,
+                    "addressdetails": 1,
+                    "countrycodes": "uz",
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+        finally:
+            await asyncio.sleep(NOMINATIM_RATE_LIMIT_SECONDS)
+
+    if not isinstance(payload, list) or not payload:
+        return None
+    result = payload[0]
+    if not isinstance(result, dict) or not _is_confident_geocode_result(query_text, result):
+        return None
+
+    try:
+        lon = float(result["lon"])
+        lat = float(result["lat"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    return ListingGeocodeResult(
+        listing_id=candidate.listing_id,
+        lon=lon,
+        lat=lat,
+        district=_extract_district(result),
+    )
+
+
+async def update_listing_geocode(
+    listing_id: str,
+    *,
+    lon: float,
+    lat: float,
+    district: str | None,
+    connection: object,
+) -> None:
+    await connection.execute(UPDATE_LISTING_GEOCODE_QUERY, listing_id, lon, lat, district)
+
+
+async def mark_listing_geocode_not_found(listing_id: str, *, connection: object) -> None:
+    await connection.execute(MARK_LISTING_GEOCODE_NOT_FOUND_QUERY, listing_id)
 
 
 async def check_olx_listing_is_deactivated(
@@ -312,8 +592,50 @@ async def deactivate_deleted_olx_listings(olx_pipeline_config: OLXPipelineConfig
     }
 
 
+@asset(name="geocode_listings")
+async def geocode_listings(olx_pipeline_config: OLXPipelineConfig) -> dict[str, int]:
+    candidates = await fetch_geocode_candidates(postgres_dsn=olx_pipeline_config.postgres_dsn)
+    if not candidates:
+        return {"listings_checked": 0, "rows_geocoded": 0, "rows_marked_not_found": 0}
+
+    rows_geocoded = 0
+    rows_marked_not_found = 0
+    semaphore = asyncio.Semaphore(1)
+
+    async with httpx.AsyncClient(headers=NOMINATIM_HEADERS, timeout=30.0) as client:
+        connection = await asyncpg.connect(olx_pipeline_config.postgres_dsn)
+        try:
+            for candidate in candidates:
+                geocode_result = await geocode_listing_candidate(
+                    candidate,
+                    client=client,
+                    semaphore=semaphore,
+                )
+                if geocode_result is None:
+                    await mark_listing_geocode_not_found(candidate.listing_id, connection=connection)
+                    rows_marked_not_found += 1
+                    continue
+
+                await update_listing_geocode(
+                    geocode_result.listing_id,
+                    lon=geocode_result.lon,
+                    lat=geocode_result.lat,
+                    district=geocode_result.district,
+                    connection=connection,
+                )
+                rows_geocoded += 1
+        finally:
+            await connection.close()
+
+    return {
+        "listings_checked": len(candidates),
+        "rows_geocoded": rows_geocoded,
+        "rows_marked_not_found": rows_marked_not_found,
+    }
+
+
 defs = Definitions(
-    assets=[raw_olx_data, clean_real_estate_data, load_to_postgres, deactivate_deleted_olx_listings],
+    assets=[raw_olx_data, clean_real_estate_data, load_to_postgres, deactivate_deleted_olx_listings, geocode_listings],
     resources={
         "olx_pipeline_config": OLXPipelineConfig(
             postgres_dsn=EnvVar("POSTGRES_CONNECTION_STRING"),
