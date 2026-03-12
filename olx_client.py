@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
+from json import JSONDecodeError
+import logging
 from typing import Any
 from urllib.parse import parse_qs, urljoin, urlparse
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from tenacity import AsyncRetrying, RetryError, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity.wait import wait_base
 
 OLX_SITE_URL = "https://www.olx.uz"
 OLX_API_PATH = "/api/v1/offers/"
 DEFAULT_PAGE_SIZE = 40
 RETRYABLE_STATUS_CODES = frozenset({403, 429})
+LOGGER = logging.getLogger(__name__)
 
 DEFAULT_HEADERS = {
     "User-Agent": (
@@ -159,6 +163,22 @@ class RetryableStatusError(Exception):
         self.status_code = status_code
 
 
+def _is_retryable_status(status_code: int) -> bool:
+    return status_code in RETRYABLE_STATUS_CODES or 500 <= status_code < 600
+
+
+def _normalize_limit(value: object, default: int) -> int:
+    if isinstance(value, int):
+        return value
+    if not isinstance(value, str):
+        return default
+
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
 class AsyncOLXClient:
     def __init__(
         self,
@@ -167,7 +187,7 @@ class AsyncOLXClient:
         timeout: float = 20.0,
         page_size: int = DEFAULT_PAGE_SIZE,
         headers: dict[str, str] | None = None,
-        retry_wait: Any = wait_exponential(multiplier=2, min=2, max=8),
+        retry_wait: wait_base = wait_exponential(multiplier=2, min=2, max=8),
     ) -> None:
         merged_headers = {**DEFAULT_HEADERS, **(headers or {})}
         self._owns_client = client is None
@@ -194,7 +214,8 @@ class AsyncOLXClient:
         }
 
         params["page"] = page
-        limit = int(str(params.get("limit", self._page_size)))
+        limit_value = params.get("limit", self._page_size)
+        limit = _normalize_limit(limit_value, self._page_size)
         params.setdefault("offset", (page - 1) * limit)
         params.setdefault("limit", limit)
 
@@ -217,12 +238,10 @@ class AsyncOLXClient:
         ):
             with attempt:
                 response = await self._client.get(request_url, params=params, headers=self._headers)
-                if response.status_code in RETRYABLE_STATUS_CODES or 500 <= response.status_code < 600:
+                if _is_retryable_status(response.status_code):
                     raise RetryableStatusError(response.status_code)
                 response.raise_for_status()
                 return OlxListingsResponse.model_validate(response.json())
-
-        raise RuntimeError("unreachable")
 
     async def fetch_category_listings(
         self,
@@ -232,7 +251,8 @@ class AsyncOLXClient:
         for page in range(1, max_pages + 1):
             try:
                 payload = await self._get_page(category_url, page)
-            except (RetryError, RetryableStatusError, httpx.HTTPError, ValueError):
+            except (RetryError, RetryableStatusError, httpx.HTTPError, JSONDecodeError) as error:
+                LOGGER.warning("Stopping OLX fetch for %s on page %s: %s", category_url, page, error)
                 return
 
             if not payload.data:
@@ -243,6 +263,7 @@ class AsyncOLXClient:
 
 
 async def fetch_category_listings(category_url: str, max_pages: int) -> AsyncGenerator[OlxListing, None]:
+    """Yield validated OLX listings for the provided category page."""
     async with AsyncOLXClient() as client:
         async for listing in client.fetch_category_listings(category_url, max_pages):
             yield listing

@@ -8,7 +8,7 @@ from tenacity import wait_none
 from olx_client import AsyncOLXClient, OlxListing
 
 
-def test_listing_model_ignores_extra_fields_and_extracts_price_from_params() -> None:
+def test_listing_model_ignores_extra_fields() -> None:
     listing = OlxListing.model_validate(
         {
             "id": 101,
@@ -29,16 +29,33 @@ def test_listing_model_ignores_extra_fields_and_extracts_price_from_params() -> 
     assert listing.id == 101
     assert listing.url == "https://www.olx.uz/d/obyavlenie/test-ID101.html"
     assert listing.title == "Yangi квартира"
-    assert listing.price is not None
-    assert listing.price.value == 125000.0
-    assert listing.price.currency == "USD"
     assert [(param.name, param.value) for param in listing.params] == [
         ("Цена", "125 000"),
         ("Площадь", "78 м²"),
     ]
 
 
-def test_async_client_retries_retryable_statuses_and_sends_browser_headers() -> None:
+def test_listing_model_extracts_price_from_params() -> None:
+    listing = OlxListing.model_validate(
+        {
+            "id": 101,
+            "relative_url": "/d/obyavlenie/test-ID101.html",
+            "title": "Yangi квартира",
+            "params": [
+                {
+                    "name": "Цена",
+                    "value": {"value": "125000", "currency": "USD", "label": "125 000"},
+                }
+            ],
+        }
+    )
+
+    assert listing.price is not None
+    assert listing.price.value == 125000.0
+    assert listing.price.currency == "USD"
+
+
+def test_async_client_retry_and_headers() -> None:
     attempts: list[int] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -57,9 +74,9 @@ def test_async_client_retries_retryable_statuses_and_sends_browser_headers() -> 
                 "data": [
                     {
                         "id": 7,
-                        "url": "https://www.olx.uz/d/obyavlenie/item-7",
+                        "relative_url": "/d/obyavlenie/item-7",
                         "title": "Retry worked",
-                        "price": {"value": 70000, "currency": "UZS"},
+                        "price": {"value": "70000", "currency": "UZS"},
                         "params": [],
                     }
                 ]
@@ -97,10 +114,10 @@ def test_async_client_yields_listings_for_multiple_pages() -> None:
                     "data": [
                         {
                             "id": 1,
-                            "url": "https://www.olx.uz/d/obyavlenie/item-1",
+                            "relative_url": "/d/obyavlenie/item-1",
                             "title": "First",
                             "price": {"value": "100000", "currency": "UZS"},
-                            "params": [{"name": "Rooms", "value": {"label": "3"}}],
+                            "params": [{"name": "Количество комнат", "value": {"label": "3"}}],
                         }
                     ]
                 },
@@ -113,10 +130,10 @@ def test_async_client_yields_listings_for_multiple_pages() -> None:
                     "data": [
                         {
                             "id": 2,
-                            "url": "https://www.olx.uz/d/obyavlenie/item-2",
+                            "relative_url": "/d/obyavlenie/item-2",
                             "title": "Second",
-                            "price": {"value": 2000, "currency": "USD"},
-                            "params": [{"name": "Area", "value": {"label": "70 m²"}}],
+                            "price": {"value": "2000", "currency": "USD"},
+                            "params": [{"name": "Площадь", "value": {"label": "70 m²"}}],
                         }
                     ]
                 },
