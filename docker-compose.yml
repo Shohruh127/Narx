@@ -1,0 +1,15 @@
+version: '3.8'
+services:
+  db:
+    image: postgis/postgis:15-3.3
+    container_name: avm_postgis
+    environment:
+      POSTGRES_USER: avm_user
+      POSTGRES_PASSWORD: avm_password
+      POSTGRES_DB: avm_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+volumes:
+  pgdata:
