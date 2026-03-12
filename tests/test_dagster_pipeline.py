@@ -523,7 +523,6 @@ def test_update_listings_nearest_metro_meters_calculates_distances(monkeypatch) 
     assert updated_rows == 3
     assert executed["dsn"] == "postgresql://user:pass@localhost:5432/narx"
     assert "nearest_metro_meters = ROUND(ST_DistanceSphere(listings.location, nearest_metro.location))::integer" in executed["query"]
-    assert "ST_DistanceSphere(listings.location, nearest_metro.location)" in executed["query"]
     assert "ORDER BY listings.location <-> metro.location, metro.id" in executed["query"]
     assert "FROM tashkent_metro_stations AS metro" in executed["query"]
     assert "listings.nearest_metro_meters IS NULL" in executed["query"]
