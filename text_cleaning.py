@@ -4,9 +4,10 @@ import re
 
 
 _NUMBER_RE = re.compile(r"\d+(?:[\s.,]\d+)*")
-_SOTIX_RE = re.compile(r"(\d+(?:[\s.,]\d+)*)\s*(?:sotix|sotka|сотка)\b", re.IGNORECASE)
-_M2_RE = re.compile(r"(\d+(?:[\s.,]\d+)*)\s*(?:kv\.?\s*m|кв\.?\s*м|m2)\b", re.IGNORECASE)
+_SOTIX_RE = re.compile(r"(\d+(?:[\s.,]\d+)*)\s*(?:sotix|sotka|сотка|сотки|соток)\b", re.IGNORECASE)
+_M2_RE = re.compile(r"(\d+(?:[\s.,]\d+)*)\s*(?:kv\.?\s*m|кв\.?\s*м|m2|м2)\b", re.IGNORECASE)
 _THOUSAND_RE = re.compile(r"\b(?:ming|тыс)\b", re.IGNORECASE)
+_ROOM_WORD_RE = re.compile(r"(?:xonali|xona|хона|комнат|комн)\b", re.IGNORECASE)
 
 
 def _parse_number(raw_number: str) -> float | None:
@@ -34,7 +35,7 @@ def _parse_number(raw_number: str) -> float | None:
                 return None
         else:
             left, right = cleaned.split(",")
-            if len(right) == 3 and left.isdigit():
+            if len(right) == 3 and left and left.isdigit():
                 cleaned = left + right
             else:
                 cleaned = left + "." + right
@@ -43,6 +44,10 @@ def _parse_number(raw_number: str) -> float | None:
             cleaned = cleaned.replace(".", "")
         else:
             return None
+    elif dot_count == 1:
+        left, right = cleaned.split(".")
+        if len(right) == 3 and left and left.isdigit():
+            cleaned = left + right
 
     try:
         return float(cleaned)
@@ -74,9 +79,20 @@ def parse_area(text: str, property_type: str) -> dict[str, float | None]:
             result["living_area_m2"] = _parse_number(m2_match.group(1))
             return result
 
-        number_matches = list(_NUMBER_RE.finditer(text))
-        if number_matches:
-            result["living_area_m2"] = _parse_number(number_matches[-1].group(0))
+        for match in _NUMBER_RE.finditer(text):
+            candidate = _parse_number(match.group(0))
+            if candidate is None or not (10 <= candidate <= 500):
+                continue
+
+            before = text[max(0, match.start() - 16):match.start()]
+            after = text[match.end():match.end() + 16]
+            if re.match(r"\s*[-,/]*\s*", after) and _ROOM_WORD_RE.match(re.sub(r"^\s*[-,/]*\s*", "", after)):
+                continue
+            if _ROOM_WORD_RE.search(before) and re.search(r"(?:xonali|xona|хона|комнат|комн)\s*[-/]*\s*$", before, flags=re.IGNORECASE):
+                continue
+
+            result["living_area_m2"] = candidate
+            break
 
     return result
 
@@ -101,7 +117,7 @@ def normalize_price(price_text: str, currency_text: str) -> tuple[float | None, 
     if amount is None:
         return None, normalized_currency
 
-    if _THOUSAND_RE.search(price_text):
+    if _THOUSAND_RE.search(f"{price_text} {currency_text}"):
         amount *= 1000
 
     return amount, normalized_currency

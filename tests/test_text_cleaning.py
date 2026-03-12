@@ -14,14 +14,38 @@ def test_parse_area_land_recognizes_cyrillic_sotka() -> None:
     assert result["living_area_m2"] is None
 
 
+def test_parse_area_land_recognizes_cyrillic_plural_sotok() -> None:
+    result = parse_area("Участок 6 соток", "land")
+    assert result["land_area_sotix"] == 6.0
+    assert result["living_area_m2"] is None
+
+
 def test_parse_area_house_recognizes_m2_alias() -> None:
     result = parse_area("Maydoni 120 m2", "house")
     assert result["living_area_m2"] == 120.0
     assert result["land_area_sotix"] is None
 
 
+def test_parse_area_house_recognizes_cyrillic_m2_alias() -> None:
+    result = parse_area("Площадь 90 м2", "house")
+    assert result["living_area_m2"] == 90.0
+    assert result["land_area_sotix"] is None
+
+
 def test_parse_area_apartment_prefers_likely_area_number() -> None:
     result = parse_area("3 xonali, 78.5", "apartment")
+    assert result["living_area_m2"] == 78.5
+    assert result["land_area_sotix"] is None
+
+
+def test_parse_area_apartment_does_not_use_room_or_floor_numbers_as_area() -> None:
+    result = parse_area("3 xonali, 2-etaj", "apartment")
+    assert result["living_area_m2"] is None
+    assert result["land_area_sotix"] is None
+
+
+def test_parse_area_apartment_keeps_area_when_room_count_is_last() -> None:
+    result = parse_area("78.5, 3 xonali", "apartment")
     assert result["living_area_m2"] == 78.5
     assert result["land_area_sotix"] is None
 
@@ -42,6 +66,12 @@ def test_normalize_price_plain_number_and_currency_symbol() -> None:
     assert currency == "USD"
 
 
+def test_normalize_price_handles_single_dot_thousand_separator() -> None:
+    amount, currency = normalize_price("65.000", "$")
+    assert amount == 65000.0
+    assert currency == "USD"
+
+
 def test_normalize_price_thousand_word_in_uzbek() -> None:
     amount, currency = normalize_price("50 ming", "uzs")
     assert amount == 50000.0
@@ -51,6 +81,12 @@ def test_normalize_price_thousand_word_in_uzbek() -> None:
 def test_normalize_price_thousand_word_in_russian() -> None:
     amount, currency = normalize_price("12 тыс", "сум")
     assert amount == 12000.0
+    assert currency == "UZS"
+
+
+def test_normalize_price_applies_thousand_multiplier_from_currency_text() -> None:
+    amount, currency = normalize_price("50", "ming so'm")
+    assert amount == 50000.0
     assert currency == "UZS"
 
 
