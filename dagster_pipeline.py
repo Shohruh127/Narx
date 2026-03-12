@@ -52,6 +52,7 @@ UPDATE_LISTING_GEOCODE_QUERY = """
     SET
         location = ST_SetSRID(ST_MakePoint($2, $3), 4326),
         district = COALESCE($4, district),
+        nearest_metro_meters = NULL,
         geocode_status = 'geocoded',
         updated_at = CURRENT_TIMESTAMP
     WHERE id = $1
@@ -60,6 +61,28 @@ MARK_LISTING_GEOCODE_NOT_FOUND_QUERY = """
     UPDATE listings
     SET geocode_status = 'not_found', updated_at = CURRENT_TIMESTAMP
     WHERE id = $1 AND location IS NULL
+"""
+UPSERT_TASHKENT_METRO_STATIONS_QUERY = """
+    INSERT INTO tashkent_metro_stations (id, name, location)
+    VALUES ($1, $2, ST_SetSRID(ST_MakePoint($3, $4), 4326))
+    ON CONFLICT (id) DO UPDATE
+    SET
+        name = EXCLUDED.name,
+        location = EXCLUDED.location
+"""
+UPDATE_NEAREST_METRO_METERS_QUERY = """
+    UPDATE listings AS listings
+    SET
+        nearest_metro_meters = ROUND(ST_DistanceSphere(listings.location, nearest_metro.location))::integer,
+        updated_at = CURRENT_TIMESTAMP
+    FROM LATERAL (
+        SELECT metro.location
+        FROM tashkent_metro_stations AS metro
+        ORDER BY listings.location <-> metro.location, metro.id
+        LIMIT 1
+    ) AS nearest_metro
+    WHERE listings.location IS NOT NULL
+      AND listings.nearest_metro_meters IS NULL
 """
 OLX_OFFER_API_URL = "https://www.olx.uz/api/v1/offers"
 OLX_CHECK_CONCURRENCY = 15
@@ -71,6 +94,20 @@ NOMINATIM_HEADERS = {
 }
 NOMINATIM_RATE_LIMIT_SECONDS = 1
 NOMINATIM_TIMEOUT_SECONDS = 30.0
+OVERPASS_API_URL = "https://overpass-api.de/api/interpreter"
+OVERPASS_HEADERS = {
+    "User-Agent": "NarxDagsterMetroIngest/1.0",
+    "Accept": "application/json",
+}
+OVERPASS_TIMEOUT_SECONDS = 60.0
+OVERPASS_TASHKENT_METRO_QUERY = """
+[out:json][timeout:60];
+area["name"="Tashkent"]["boundary"="administrative"]->.searchArea;
+(
+  node["railway"="station"]["station"="subway"](area.searchArea);
+);
+out body;
+""".strip()
 MIN_GEOCODE_TOKEN_LENGTH = 3
 MIN_GEOCODE_IMPORTANCE_THRESHOLD = 0.05
 UZBEK_CITY_HINTS = {
@@ -168,6 +205,14 @@ class ListingGeocodeResult:
     lon: float
     lat: float
     district: str | None
+
+
+@dataclass(frozen=True)
+class MetroStation:
+    station_id: int
+    name: str
+    lon: float
+    lat: float
 
 
 def _price_to_uzs(amount: float | None, currency: str | None, usd_to_uzs_rate: float | None) -> float | None:
@@ -297,6 +342,60 @@ async def fetch_geocode_candidates(*, postgres_dsn: str) -> list[ListingGeocodeC
         )
         for row in rows
     ]
+
+
+async def fetch_tashkent_metro_stations(*, client: httpx.AsyncClient) -> list[MetroStation]:
+    response = await client.post(OVERPASS_API_URL, content=OVERPASS_TASHKENT_METRO_QUERY)
+    response.raise_for_status()
+    payload = response.json()
+    elements = payload.get("elements") if isinstance(payload, dict) else None
+    if not isinstance(elements, list):
+        return []
+
+    stations_by_id: dict[int, MetroStation] = {}
+    for element in elements:
+        if not isinstance(element, dict) or element.get("type") != "node":
+            continue
+        tags = element.get("tags")
+        if not isinstance(tags, dict):
+            continue
+        name = tags.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+
+        try:
+            station_id = int(element["id"])
+            lon = float(element["lon"])
+            lat = float(element["lat"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        stations_by_id[station_id] = MetroStation(
+            station_id=station_id,
+            name=name.strip(),
+            lon=lon,
+            lat=lat,
+        )
+
+    return [stations_by_id[station_id] for station_id in sorted(stations_by_id)]
+
+
+async def upsert_tashkent_metro_stations(
+    stations: Iterable[MetroStation],
+    *,
+    postgres_dsn: str,
+) -> int:
+    records = [(station.station_id, station.name, station.lon, station.lat) for station in stations]
+    if not records:
+        return 0
+
+    connection = await asyncpg.connect(postgres_dsn)
+    try:
+        await connection.executemany(UPSERT_TASHKENT_METRO_STATIONS_QUERY, records)
+    finally:
+        await connection.close()
+
+    return len(records)
 
 
 def _detect_city_hint(*texts: str | None) -> str:
@@ -543,6 +642,16 @@ async def load_dataframe_to_postgres(dataframe: pd.DataFrame, *, postgres_dsn: s
     return len(records)
 
 
+async def update_listings_nearest_metro_meters(*, postgres_dsn: str) -> int:
+    connection = await asyncpg.connect(postgres_dsn)
+    try:
+        command = await connection.execute(UPDATE_NEAREST_METRO_METERS_QUERY)
+    finally:
+        await connection.close()
+
+    return _parse_updated_rows(command)
+
+
 @asset
 async def raw_olx_data(olx_pipeline_config: OLXPipelineConfig) -> list[OlxListing]:
     return await fetch_raw_olx_data(
@@ -575,6 +684,18 @@ async def load_to_postgres(
         postgres_dsn=olx_pipeline_config.postgres_dsn,
     )
     return {"rows_loaded": loaded_rows}
+
+
+@asset(name="ingest_tashkent_metro_stations")
+async def ingest_tashkent_metro_stations(olx_pipeline_config: OLXPipelineConfig) -> dict[str, int]:
+    async with httpx.AsyncClient(headers=OVERPASS_HEADERS, timeout=OVERPASS_TIMEOUT_SECONDS) as client:
+        stations = await fetch_tashkent_metro_stations(client=client)
+
+    upserted_rows = await upsert_tashkent_metro_stations(
+        stations,
+        postgres_dsn=olx_pipeline_config.postgres_dsn,
+    )
+    return {"stations_fetched": len(stations), "rows_upserted": upserted_rows}
 
 
 @asset
@@ -641,8 +762,22 @@ async def geocode_listings(olx_pipeline_config: OLXPipelineConfig) -> dict[str, 
     }
 
 
+@asset(deps=[ingest_tashkent_metro_stations, geocode_listings], name="update_listings_nearest_metro")
+async def update_listings_nearest_metro(olx_pipeline_config: OLXPipelineConfig) -> dict[str, int]:
+    updated_rows = await update_listings_nearest_metro_meters(postgres_dsn=olx_pipeline_config.postgres_dsn)
+    return {"rows_updated": updated_rows}
+
+
 defs = Definitions(
-    assets=[raw_olx_data, clean_real_estate_data, load_to_postgres, deactivate_deleted_olx_listings, geocode_listings],
+    assets=[
+        raw_olx_data,
+        clean_real_estate_data,
+        load_to_postgres,
+        ingest_tashkent_metro_stations,
+        deactivate_deleted_olx_listings,
+        geocode_listings,
+        update_listings_nearest_metro,
+    ],
     resources={
         "olx_pipeline_config": OLXPipelineConfig(
             postgres_dsn=EnvVar("POSTGRES_CONNECTION_STRING"),

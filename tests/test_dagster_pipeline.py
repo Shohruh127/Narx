@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import httpx
 import pandas as pd
@@ -9,18 +10,24 @@ from tenacity import wait_none
 from dagster_pipeline import (
     ListingGeocodeCandidate,
     ListingGeocodeResult,
+    MetroStation,
     build_listing_upsert_query,
     deactivate_olx_source_ids,
     clean_listings_dataframe,
     fetch_geocode_candidates,
     fetch_active_olx_source_ids,
     fetch_raw_olx_data,
+    fetch_tashkent_metro_stations,
     find_deactivated_olx_source_ids,
     geocode_listing_candidate,
     geocode_listings,
+    ingest_tashkent_metro_stations,
     load_dataframe_to_postgres,
     mark_listing_geocode_not_found,
+    update_listings_nearest_metro,
+    update_listings_nearest_metro_meters,
     update_listing_geocode,
+    upsert_tashkent_metro_stations,
 )
 from olx_client import OlxListing
 
@@ -318,6 +325,95 @@ def test_fetch_geocode_candidates_reads_only_active_olx_rows_without_location(mo
     assert executed["closed"] is True
 
 
+def test_fetch_tashkent_metro_stations_filters_invalid_rows() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.method == "POST"
+        assert request.url == "https://overpass-api.de/api/interpreter"
+        assert 'node["railway"="station"]["station"="subway"]' in request.content.decode()
+        return httpx.Response(
+            200,
+            json={
+                "elements": [
+                    {
+                        "type": "node",
+                        "id": 2,
+                        "lat": 41.2995,
+                        "lon": 69.2401,
+                        "tags": {"name": "Amir Temur Xiyoboni"},
+                    },
+                    {
+                        "type": "node",
+                        "id": 1,
+                        "lat": 41.3100,
+                        "lon": 69.2800,
+                        "tags": {"name": "Buyuk Ipak Yo'li"},
+                    },
+                    {
+                        "type": "node",
+                        "id": 99,
+                        "lat": 41.0,
+                        "lon": 69.0,
+                        "tags": {},
+                    },
+                ]
+            },
+        )
+
+    async def run_fetch() -> list[MetroStation]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await fetch_tashkent_metro_stations(client=client)
+
+    stations = asyncio.run(run_fetch())
+
+    assert stations == [
+        MetroStation(station_id=1, name="Buyuk Ipak Yo'li", lon=69.2800, lat=41.3100),
+        MetroStation(station_id=2, name="Amir Temur Xiyoboni", lon=69.2401, lat=41.2995),
+    ]
+    assert len(requests) == 1
+
+
+def test_upsert_tashkent_metro_stations_executes_postgis_upsert(monkeypatch) -> None:
+    executed: dict[str, object] = {}
+
+    class FakeConnection:
+        async def executemany(self, query: str, records: list[tuple[object, ...]]) -> None:
+            executed["query"] = query
+            executed["records"] = records
+
+        async def close(self) -> None:
+            executed["closed"] = True
+
+    async def fake_connect(dsn: str) -> FakeConnection:
+        executed["dsn"] = dsn
+        return FakeConnection()
+
+    monkeypatch.setattr("dagster_pipeline.asyncpg.connect", fake_connect)
+
+    upserted_rows = asyncio.run(
+        upsert_tashkent_metro_stations(
+            [
+                MetroStation(station_id=1, name="Buyuk Ipak Yo'li", lon=69.2800, lat=41.3100),
+                MetroStation(station_id=2, name="Amir Temur Xiyoboni", lon=69.2401, lat=41.2995),
+            ],
+            postgres_dsn="postgresql://user:pass@localhost:5432/narx",
+        )
+    )
+
+    assert upserted_rows == 2
+    assert executed["dsn"] == "postgresql://user:pass@localhost:5432/narx"
+    assert "INSERT INTO tashkent_metro_stations" in executed["query"]
+    assert "ST_SetSRID(ST_MakePoint($3, $4), 4326)" in executed["query"]
+    assert "ON CONFLICT (id) DO UPDATE" in executed["query"]
+    assert executed["records"] == [
+        (1, "Buyuk Ipak Yo'li", 69.2800, 41.3100),
+        (2, "Amir Temur Xiyoboni", 69.2401, 41.2995),
+    ]
+    assert executed["closed"] is True
+
+
 def test_geocode_listing_candidate_falls_back_to_tashkent_and_waits(monkeypatch) -> None:
     requests: list[httpx.Request] = []
     sleeps: list[int] = []
@@ -394,10 +490,43 @@ def test_update_listing_geocode_and_not_found_use_expected_queries() -> None:
 
     assert "ST_SetSRID(ST_MakePoint($2, $3), 4326)" in executed[0][0]
     assert "district = COALESCE($4, district)" in executed[0][0]
+    assert "nearest_metro_meters = NULL" in executed[0][0]
     assert "geocode_status = 'geocoded'" in executed[0][0]
     assert executed[0][1] == ("listing-1", 69.2034, 41.2756, "Chilonzor tumani")
     assert "geocode_status = 'not_found'" in executed[1][0]
     assert executed[1][1] == ("listing-2",)
+
+
+def test_update_listings_nearest_metro_meters_calculates_distances(monkeypatch) -> None:
+    executed: dict[str, object] = {}
+
+    class FakeConnection:
+        async def execute(self, query: str) -> str:
+            executed["query"] = query
+            return "UPDATE 3"
+
+        async def close(self) -> None:
+            executed["closed"] = True
+
+    async def fake_connect(dsn: str) -> FakeConnection:
+        executed["dsn"] = dsn
+        return FakeConnection()
+
+    monkeypatch.setattr("dagster_pipeline.asyncpg.connect", fake_connect)
+
+    updated_rows = asyncio.run(
+        update_listings_nearest_metro_meters(
+            postgres_dsn="postgresql://user:pass@localhost:5432/narx"
+        )
+    )
+
+    assert updated_rows == 3
+    assert executed["dsn"] == "postgresql://user:pass@localhost:5432/narx"
+    assert "nearest_metro_meters = ROUND(ST_DistanceSphere(listings.location, nearest_metro.location))::integer" in executed["query"]
+    assert "ORDER BY listings.location <-> metro.location, metro.id" in executed["query"]
+    assert "FROM tashkent_metro_stations AS metro" in executed["query"]
+    assert "listings.nearest_metro_meters IS NULL" in executed["query"]
+    assert executed["closed"] is True
 
 
 def test_geocode_listings_asset_marks_success_and_not_found(monkeypatch) -> None:
@@ -465,3 +594,69 @@ def test_geocode_listings_asset_marks_success_and_not_found(monkeypatch) -> None
     assert any("geocode_status = 'geocoded'" in query for query, _ in updates if query != "closed")
     assert any("geocode_status = 'not_found'" in query for query, _ in updates if query != "closed")
     assert updates[-1] == ("closed", ())
+
+
+def test_ingest_tashkent_metro_stations_asset_returns_fetch_and_upsert_counts(monkeypatch) -> None:
+    async def fake_fetch_tashkent_metro_stations(*, client: httpx.AsyncClient) -> list[MetroStation]:
+        assert isinstance(client, httpx.AsyncClient)
+        return [
+            MetroStation(station_id=1, name="Buyuk Ipak Yo'li", lon=69.2800, lat=41.3100),
+            MetroStation(station_id=2, name="Amir Temur Xiyoboni", lon=69.2401, lat=41.2995),
+        ]
+
+    async def fake_upsert_tashkent_metro_stations(
+        stations: list[MetroStation],
+        *,
+        postgres_dsn: str,
+    ) -> int:
+        assert postgres_dsn == "postgresql://user:pass@localhost:5432/narx"
+        assert len(stations) == 2
+        return 2
+
+    monkeypatch.setattr("dagster_pipeline.fetch_tashkent_metro_stations", fake_fetch_tashkent_metro_stations)
+    monkeypatch.setattr("dagster_pipeline.upsert_tashkent_metro_stations", fake_upsert_tashkent_metro_stations)
+
+    summary = asyncio.run(
+        ingest_tashkent_metro_stations.op.compute_fn.decorated_fn(
+            type(
+                "Config",
+                (),
+                {"postgres_dsn": "postgresql://user:pass@localhost:5432/narx"},
+            )()
+        )
+    )
+
+    assert summary == {"stations_fetched": 2, "rows_upserted": 2}
+
+
+def test_update_listings_nearest_metro_asset_returns_updated_rows(monkeypatch) -> None:
+    async def fake_update_listings_nearest_metro_meters(*, postgres_dsn: str) -> int:
+        assert postgres_dsn == "postgresql://user:pass@localhost:5432/narx"
+        return 7
+
+    monkeypatch.setattr(
+        "dagster_pipeline.update_listings_nearest_metro_meters",
+        fake_update_listings_nearest_metro_meters,
+    )
+
+    summary = asyncio.run(
+        update_listings_nearest_metro.op.compute_fn.decorated_fn(
+            type(
+                "Config",
+                (),
+                {"postgres_dsn": "postgresql://user:pass@localhost:5432/narx"},
+            )()
+        )
+    )
+
+    assert summary == {"rows_updated": 7}
+
+
+def test_sql_schema_includes_tashkent_metro_table_and_nearest_metro_column() -> None:
+    schema_sql = (
+        Path(__file__).resolve().parents[1] / "sql" / "listings_exchange_rates.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "CREATE TABLE tashkent_metro_stations" in schema_sql
+    assert "nearest_metro_meters integer" in schema_sql
+    assert "idx_tashkent_metro_stations_location" in schema_sql
