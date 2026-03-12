@@ -1,16 +1,10 @@
 BEGIN;
 
+-- 1. Kengaytmalar (Extensions)
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 CREATE EXTENSION IF NOT EXISTS postgis;
 
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'record_status') THEN
-        CREATE TYPE record_status AS ENUM ('active', 'inactive');
-    END IF;
-END
-$$;
-
+-- 2. UUIDv7 Funksiyasi (Vaqtga asoslangan, B-Tree uchun optimallashtirilgan)
 CREATE OR REPLACE FUNCTION generate_uuid_v7()
 RETURNS uuid
 LANGUAGE plpgsql
@@ -22,170 +16,83 @@ DECLARE
 BEGIN
     unix_ts_ms := floor(extract(epoch FROM clock_timestamp()) * 1000);
     uuid_bytes := gen_random_bytes(16);
-
     uuid_bytes := overlay(uuid_bytes placing substring(int8send(unix_ts_ms) FROM 3 FOR 6) FROM 1 FOR 6);
     uuid_bytes := set_byte(uuid_bytes, 6, (get_byte(uuid_bytes, 6) & 15) | 112);
     uuid_bytes := set_byte(uuid_bytes, 8, (get_byte(uuid_bytes, 8) & 63) | 128);
-
     RETURN encode(uuid_bytes, 'hex')::uuid;
 END;
 $$;
 
+-- 3. Asosiy Jadvallar (Tables)
 CREATE TABLE listings (
-    id uuid NOT NULL DEFAULT generate_uuid_v7(),
-    property_type varchar(20) NOT NULL CHECK (property_type IN ('apartment', 'house', 'land', 'commercial')),
-    title text NOT NULL,
+    id uuid NOT NULL DEFAULT generate_uuid_v7() PRIMARY KEY,
+    
+    -- UPSERT uchun eng muhim maydonlar
+    source varchar(50) NOT NULL,       -- masalan: 'olx', 'uybor'
+    source_id varchar(100) NOT NULL,   -- saytdagi asl e'lon ID'si
+    
+    -- Obyekt xususiyatlari
+    property_type varchar(20),         -- 'apartment', 'house', 'land'
+    deal_type varchar(20),             -- 'sale', 'rent'
+    title text,
     description text,
-    price_original numeric(18, 2) NOT NULL CHECK (price_original >= 0),
-    currency_original varchar(8) NOT NULL,
-    price_uzs_normalized numeric(18, 2) NOT NULL CHECK (price_uzs_normalized >= 0),
+    
+    -- Narxlar
+    price_original numeric(18, 2),
+    currency_original varchar(10),     -- 'UZS', 'USD', 'y.e.'
+    price_uzs_normalized numeric(18, 2),
+    price_usd_normalized numeric(18, 2),
+    
+    -- Maydonlar (Hech qanday qat'iy CHECK yo'q, iflos ma'lumotga chidamli)
     land_area_sotix numeric(12, 2),
     living_area_m2 numeric(12, 2),
-    room_count smallint CHECK (room_count IS NULL OR room_count >= 0),
-    address text,
-    location geometry(Point, 4326) NOT NULL,
-    status record_status NOT NULL DEFAULT 'active',
+    room_count smallint,
+    
+    -- Lokatsiya
+    address_raw text,
+    location geometry(Point, 4326),
+    
+    -- Meta ma'lumotlar
+    status varchar(20) NOT NULL DEFAULT 'active', -- 'active', 'inactive', 'sold'
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT listings_pk PRIMARY KEY (id, status, created_at),
-    CONSTRAINT listings_area_values_chk CHECK (
-        (land_area_sotix IS NULL OR land_area_sotix >= 0)
-        AND (living_area_m2 IS NULL OR living_area_m2 >= 0)
-    ),
-    CONSTRAINT listings_area_required_chk CHECK (
-        CASE property_type
-            WHEN 'land' THEN land_area_sotix IS NOT NULL
-            WHEN 'house' THEN land_area_sotix IS NOT NULL AND living_area_m2 IS NOT NULL
-            WHEN 'apartment' THEN living_area_m2 IS NOT NULL
-            ELSE TRUE
-        END
-    )
-) PARTITION BY LIST (status);
 
-COMMENT ON COLUMN listings.id IS
-    'UUIDv7 identifier; the primary key also includes partition columns because PostgreSQL requires partition keys in UNIQUE/PRIMARY KEY constraints on partitioned tables.';
-
-CREATE TABLE listing_id_registry (
-    id uuid PRIMARY KEY
+    -- Global unikallik (Upsert ishlashi uchun shart!)
+    CONSTRAINT uq_listings_source_id UNIQUE (source, source_id)
 );
-
-CREATE TABLE listings_active
-    PARTITION OF listings
-    FOR VALUES IN ('active')
-    PARTITION BY RANGE (created_at);
-
-CREATE TABLE listings_inactive
-    PARTITION OF listings
-    FOR VALUES IN ('inactive')
-    PARTITION BY RANGE (created_at);
 
 CREATE TABLE exchange_rates (
-    id uuid NOT NULL DEFAULT generate_uuid_v7(),
+    id uuid NOT NULL DEFAULT generate_uuid_v7() PRIMARY KEY,
     currency_code varchar(8) NOT NULL,
-    rate_to_uzs numeric(18, 6) NOT NULL CHECK (rate_to_uzs > 0),
+    rate_to_uzs numeric(18, 6) NOT NULL,
     rate_date date NOT NULL,
-    status record_status NOT NULL DEFAULT 'active',
     created_at timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT exchange_rates_pk PRIMARY KEY (id, status, created_at),
-    CONSTRAINT exchange_rates_currency_code_chk CHECK (currency_code = upper(currency_code))
-) PARTITION BY LIST (status);
-
-COMMENT ON COLUMN exchange_rates.id IS
-    'UUIDv7 identifier; the primary key also includes partition columns because PostgreSQL requires partition keys in UNIQUE/PRIMARY KEY constraints on partitioned tables.';
-
-CREATE TABLE exchange_rate_id_registry (
-    id uuid PRIMARY KEY
+    
+    -- Bir kunda bitta valyuta uchun faqat bitta kurs bo'lishi shart
+    CONSTRAINT uq_exchange_rates_date UNIQUE (currency_code, rate_date)
 );
 
-CREATE TABLE exchange_rates_active
-    PARTITION OF exchange_rates
-    FOR VALUES IN ('active')
-    PARTITION BY RANGE (created_at);
+-- 4. Geospatial va Qidiruv Indekslari
+-- PostGIS orqali radius bo'yicha qidiruvni tezlashtirish uchun GiST indeksi.
+CREATE INDEX idx_listings_location ON listings USING GIST (location);
 
-CREATE TABLE exchange_rates_inactive
-    PARTITION OF exchange_rates
-    FOR VALUES IN ('inactive')
-    PARTITION BY RANGE (created_at);
+-- Analitika va filterlar uchun B-Tree indekslar
+CREATE INDEX idx_listings_status ON listings (status);
+CREATE INDEX idx_listings_created_at ON listings (created_at DESC);
+CREATE INDEX idx_listings_property_type ON listings (property_type);
 
-CREATE OR REPLACE FUNCTION create_monthly_real_estate_partitions(partition_month date)
-RETURNS void
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    month_start date := date_trunc('month', partition_month)::date;
-    month_end date := (date_trunc('month', partition_month) + interval '1 month')::date;
-    suffix text := to_char(date_trunc('month', partition_month), 'YYYYMM');
+-- 5. Avtomatik updated_at triggeri (Faqat shu trigger qoldirildi)
+CREATE OR REPLACE FUNCTION update_modified_column()
+RETURNS TRIGGER AS $$
 BEGIN
-    EXECUTE format(
-        'CREATE TABLE IF NOT EXISTS listings_active_%s PARTITION OF listings_active FOR VALUES FROM (%L) TO (%L)',
-        suffix,
-        month_start,
-        month_end
-    );
-
-    EXECUTE format(
-        'CREATE TABLE IF NOT EXISTS listings_inactive_%s PARTITION OF listings_inactive FOR VALUES FROM (%L) TO (%L)',
-        suffix,
-        month_start,
-        month_end
-    );
-
-    EXECUTE format(
-        'CREATE TABLE IF NOT EXISTS exchange_rates_active_%s PARTITION OF exchange_rates_active FOR VALUES FROM (%L) TO (%L)',
-        suffix,
-        month_start,
-        month_end
-    );
-
-    EXECUTE format(
-        'CREATE TABLE IF NOT EXISTS exchange_rates_inactive_%s PARTITION OF exchange_rates_inactive FOR VALUES FROM (%L) TO (%L)',
-        suffix,
-        month_start,
-        month_end
-    );
-END;
-$$;
-
-CREATE OR REPLACE FUNCTION reserve_partitioned_uuid()
-RETURNS trigger
-LANGUAGE plpgsql
-AS $$
-BEGIN
-    IF TG_OP = 'UPDATE' AND NEW.id <> OLD.id THEN
-        RAISE EXCEPTION '% id cannot be updated after insert', TG_TABLE_NAME
-            USING ERRCODE = 'feature_not_supported';
-    END IF;
-
-    IF TG_OP = 'INSERT' THEN
-        BEGIN
-            EXECUTE format('INSERT INTO %I (id) VALUES ($1)', TG_ARGV[0])
-            USING NEW.id;
-        EXCEPTION
-            WHEN unique_violation THEN
-                RAISE EXCEPTION '% already contains id %', TG_TABLE_NAME, NEW.id
-                    USING ERRCODE = 'unique_violation';
-        END;
-    END IF;
-
+    NEW.updated_at = now();
     RETURN NEW;
 END;
-$$;
+$$ language 'plpgsql';
 
-SELECT create_monthly_real_estate_partitions(current_date);
-SELECT create_monthly_real_estate_partitions((current_date + interval '1 month')::date);
-
-CREATE INDEX listings_location_gix ON listings USING GIST (location);
-CREATE INDEX listings_created_at_idx ON listings (created_at);
-CREATE INDEX exchange_rates_currency_rate_date_idx ON exchange_rates (currency_code, rate_date DESC);
-
-CREATE TRIGGER listings_global_id_uniqueness_trg
-BEFORE INSERT OR UPDATE OF id ON listings
+CREATE TRIGGER trg_listings_updated_at
+BEFORE UPDATE ON listings
 FOR EACH ROW
-EXECUTE FUNCTION reserve_partitioned_uuid('listing_id_registry');
-
-CREATE TRIGGER exchange_rates_global_id_uniqueness_trg
-BEFORE INSERT OR UPDATE OF id ON exchange_rates
-FOR EACH ROW
-EXECUTE FUNCTION reserve_partitioned_uuid('exchange_rate_id_registry');
+EXECUTE FUNCTION update_modified_column();
 
 COMMIT;
