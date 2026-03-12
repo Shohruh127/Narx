@@ -73,6 +73,9 @@ class OlxPrice(BaseModel):
         if not isinstance(data, dict):
             return data
 
+        if data.get("arrange") is True:
+            return {"value": None, "currency": data.get("currency")}
+
         raw_value = data.get("value", data.get("amount", data.get("price")))
         currency = data.get("currency")
 
@@ -203,8 +206,14 @@ class AsyncOLXClient:
         if self._owns_client:
             await self._client.aclose()
 
-    def _build_request(self, category_url: str, page: int) -> tuple[str, dict[str, str | int]]:
-        parsed = urlparse(category_url)
+    def _build_request(
+        self,
+        category_url: str | None,
+        page: int,
+        *,
+        category_id: int | None = None,
+    ) -> tuple[str, dict[str, str | int]]:
+        parsed = urlparse(category_url or "")
         base_url = f"{parsed.scheme or 'https'}://{parsed.netloc or 'www.olx.uz'}{OLX_API_PATH}"
 
         params: dict[str, str | int] = {
@@ -219,16 +228,21 @@ class AsyncOLXClient:
         params.setdefault("offset", (page - 1) * limit)
         params.setdefault("limit", limit)
 
-        if not parsed.path.startswith("/api/"):
-            segments = [segment for segment in parsed.path.split("/") if segment]
-            if segments:
-                params.setdefault("category_slug", segments[-1])
-                params.setdefault("category_path", "/".join(segments))
+        if category_id is not None:
+            params["category_id"] = category_id
+        elif not parsed.path.startswith("/api/"):
+            raise ValueError("category_id is required for non-API OLX category URLs")
 
         return base_url, params
 
-    async def _get_page(self, category_url: str, page: int) -> OlxListingsResponse:
-        request_url, params = self._build_request(category_url, page)
+    async def _get_page(
+        self,
+        category_url: str | None,
+        page: int,
+        *,
+        category_id: int | None = None,
+    ) -> OlxListingsResponse:
+        request_url, params = self._build_request(category_url, page, category_id=category_id)
 
         async for attempt in AsyncRetrying(
             retry=retry_if_exception_type((RetryableStatusError, httpx.TransportError)),
@@ -245,25 +259,48 @@ class AsyncOLXClient:
 
     async def fetch_category_listings(
         self,
-        category_url: str,
+        category_url: str | None,
         max_pages: int,
+        *,
+        category_id: int | None = None,
     ) -> AsyncGenerator[OlxListing, None]:
+        seen_listing_ids: set[int] = set()
+
         for page in range(1, max_pages + 1):
             try:
-                payload = await self._get_page(category_url, page)
-            except (RetryError, RetryableStatusError, httpx.HTTPError, JSONDecodeError) as error:
+                payload = await self._get_page(category_url, page, category_id=category_id)
+            except (RetryError, RetryableStatusError, httpx.HTTPError, JSONDecodeError, ValueError) as error:
                 LOGGER.warning("Stopping OLX fetch for %s on page %s: %s", category_url, page, error)
                 return
 
             if not payload.data:
                 return
 
+            page_has_new_ids = False
             for listing in payload.data:
+                if listing.id in seen_listing_ids:
+                    continue
+
+                page_has_new_ids = True
+                seen_listing_ids.add(listing.id)
                 yield listing
 
+            if not page_has_new_ids:
+                LOGGER.info("Stopping OLX fetch for %s on page %s due to repeated listing IDs", category_url, page)
+                return
 
-async def fetch_category_listings(category_url: str, max_pages: int) -> AsyncGenerator[OlxListing, None]:
-    """Yield validated OLX listings for the provided category page."""
+
+async def fetch_category_listings(
+    category_url: str | None,
+    max_pages: int,
+    *,
+    category_id: int | None = None,
+) -> AsyncGenerator[OlxListing, None]:
+    """Yield validated OLX listings for the provided category page or category ID."""
     async with AsyncOLXClient() as client:
-        async for listing in client.fetch_category_listings(category_url, max_pages):
+        async for listing in client.fetch_category_listings(
+            category_url,
+            max_pages,
+            category_id=category_id,
+        ):
             yield listing

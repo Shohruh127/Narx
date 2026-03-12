@@ -55,6 +55,55 @@ def test_listing_model_extracts_price_from_params() -> None:
     assert listing.price.currency == "USD"
 
 
+def test_listing_model_accepts_arranged_and_zero_prices() -> None:
+    arranged = OlxListing.model_validate(
+        {
+            "id": 202,
+            "relative_url": "/d/obyavlenie/arranged-ID202.html",
+            "title": "Kelishiladi",
+            "price": {"arrange": True},
+            "params": [],
+        }
+    )
+    zero_price = OlxListing.model_validate(
+        {
+            "id": 203,
+            "relative_url": "/d/obyavlenie/zero-ID203.html",
+            "title": "Nol narx",
+            "price": {"value": 0, "currency": "UZS"},
+            "params": [],
+        }
+    )
+
+    assert arranged.price is not None
+    assert arranged.price.value is None
+    assert arranged.price.currency is None
+    assert zero_price.price is not None
+    assert zero_price.price.value == 0.0
+    assert zero_price.price.currency == "UZS"
+
+
+def test_build_request_uses_category_id_instead_of_path_slug() -> None:
+    client = AsyncOLXClient()
+
+    try:
+        request_url, params = client._build_request(
+            "https://www.olx.uz/nedvizhimost/kvartiry/arenda-kvartir/?currency=USD",
+            2,
+            category_id=123,
+        )
+    finally:
+        asyncio.run(client.__aexit__(None, None, None))
+
+    assert request_url == "https://www.olx.uz/api/v1/offers/"
+    assert params["category_id"] == 123
+    assert params["currency"] == "USD"
+    assert params["page"] == 2
+    assert params["offset"] == 40
+    assert "category_slug" not in params
+    assert "category_path" not in params
+
+
 def test_async_client_retry_and_headers() -> None:
     attempts: list[int] = []
 
@@ -91,6 +140,7 @@ def test_async_client_retry_and_headers() -> None:
                 async for listing in client.fetch_category_listings(
                     "https://www.olx.uz/nedvizhimost/kvartiry/",
                     max_pages=1,
+                    category_id=1147,
                 )
             ]
 
@@ -149,6 +199,7 @@ def test_async_client_yields_listings_for_multiple_pages() -> None:
                 async for listing in client.fetch_category_listings(
                     "https://www.olx.uz/nedvizhimost/kvartiry/?currency=USD",
                     max_pages=3,
+                    category_id=1147,
                 )
             ]
 
@@ -160,6 +211,78 @@ def test_async_client_yields_listings_for_multiple_pages() -> None:
     assert listings[1].price.currency == "USD"
     assert "page=1" in requests_seen[0]
     assert "offset=0" in requests_seen[0]
-    assert "category_slug=kvartiry" in requests_seen[0]
+    assert "category_id=1147" in requests_seen[0]
     assert "page=2" in requests_seen[1]
     assert "offset=40" in requests_seen[1]
+
+
+def test_async_client_stops_when_page_only_contains_duplicates() -> None:
+    requests_seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests_seen.append(str(request.url))
+        page = int(request.url.params["page"])
+
+        if page == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": 99,
+                            "relative_url": "/d/obyavlenie/item-99",
+                            "title": "Original",
+                            "price": {"value": "99000", "currency": "UZS"},
+                            "params": [],
+                        }
+                    ]
+                },
+            )
+
+        if page == 2:
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": 99,
+                            "relative_url": "/d/obyavlenie/item-99",
+                            "title": "Original duplicate",
+                            "price": {"value": "99000", "currency": "UZS"},
+                            "params": [],
+                        }
+                    ]
+                },
+            )
+
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": 100,
+                        "relative_url": "/d/obyavlenie/item-100",
+                        "title": "Should not be reached",
+                        "price": {"value": "100000", "currency": "UZS"},
+                        "params": [],
+                    }
+                ]
+            },
+        )
+
+    async def collect() -> list[OlxListing]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as raw_client:
+            client = AsyncOLXClient(client=raw_client, retry_wait=wait_none())
+            return [
+                listing
+                async for listing in client.fetch_category_listings(
+                    "https://www.olx.uz/nedvizhimost/kvartiry/",
+                    max_pages=5,
+                    category_id=1147,
+                )
+            ]
+
+    listings = asyncio.run(collect())
+
+    assert [listing.id for listing in listings] == [99]
+    assert len(requests_seen) == 2
