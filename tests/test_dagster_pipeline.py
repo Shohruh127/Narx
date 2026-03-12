@@ -318,7 +318,7 @@ def test_fetch_geocode_candidates_reads_only_active_olx_rows_without_location(mo
     assert executed["closed"] is True
 
 
-def test_geocode_listing_candidate_appends_uzbekistan_and_waits(monkeypatch) -> None:
+def test_geocode_listing_candidate_falls_back_to_tashkent_and_waits(monkeypatch) -> None:
     requests: list[httpx.Request] = []
     sleeps: list[int] = []
 

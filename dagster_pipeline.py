@@ -70,6 +70,9 @@ NOMINATIM_HEADERS = {
     "Accept-Language": "uz,en",
 }
 NOMINATIM_RATE_LIMIT_SECONDS = 1
+NOMINATIM_TIMEOUT_SECONDS = 30.0
+MIN_GEOCODE_TOKEN_LENGTH = 3
+MIN_GEOCODE_IMPORTANCE_THRESHOLD = 0.05
 UZBEK_CITY_HINTS = {
     "tashkent": "Tashkent",
     "toshkent": "Tashkent",
@@ -106,7 +109,8 @@ UZBEK_CITY_HINTS = {
     "xiva": "Khiva",
     "khiva": "Khiva",
 }
-GEOCODE_TOKEN_PATTERN = re.compile(r"[0-9A-Za-zА-Яа-яЁёЎўҚқҒғҲҳʼ'`-]+")
+GEOCODE_TOKEN_NORMALIZATION = str.maketrans({"-": " ", "'": " ", "`": " ", "ʼ": " "})
+GEOCODE_TOKEN_PATTERN = re.compile(r"[0-9A-Za-zА-Яа-яЁёЎўҚқҒғҲҳ]+")
 GEOCODE_STOPWORDS = frozenset(
     {
         "uzbekistan",
@@ -154,7 +158,7 @@ class OLXRetryableStatusError(Exception):
 @dataclass(frozen=True)
 class ListingGeocodeCandidate:
     listing_id: str
-    title: str
+    title: str | None
     address_raw: str | None
 
 
@@ -288,7 +292,7 @@ async def fetch_geocode_candidates(*, postgres_dsn: str) -> list[ListingGeocodeC
     return [
         ListingGeocodeCandidate(
             listing_id=str(row["id"]),
-            title="" if row["title"] is None else str(row["title"]),
+            title=None if row["title"] is None else str(row["title"]),
             address_raw=None if row["address_raw"] is None else str(row["address_raw"]),
         )
         for row in rows
@@ -307,7 +311,10 @@ def _detect_city_hint(*texts: str | None) -> str:
 
 
 def _build_geocode_query_text(candidate: ListingGeocodeCandidate) -> str | None:
-    base_text = (candidate.address_raw or candidate.title).strip()
+    base_source = candidate.address_raw or candidate.title
+    if base_source is None:
+        return None
+    base_text = base_source.strip()
     if not base_text:
         return None
 
@@ -325,9 +332,9 @@ def _build_geocode_query_text(candidate: ListingGeocodeCandidate) -> str | None:
 
 def _tokenize_geocode_text(value: str) -> set[str]:
     normalized_tokens = set()
-    for match in GEOCODE_TOKEN_PATTERN.findall(value.casefold()):
-        token = match.strip("-'`ʼ")
-        if len(token) < 3 or token in GEOCODE_STOPWORDS:
+    normalized_value = value.casefold().translate(GEOCODE_TOKEN_NORMALIZATION)
+    for token in GEOCODE_TOKEN_PATTERN.findall(normalized_value):
+        if token in GEOCODE_STOPWORDS or len(token) < MIN_GEOCODE_TOKEN_LENGTH:
             continue
         normalized_tokens.add(token)
     return normalized_tokens
@@ -358,7 +365,7 @@ def _is_confident_geocode_result(query_text: str, result: dict[str, object]) -> 
         importance_value = float(importance) if isinstance(importance, (int, float, str)) else None
     except ValueError:
         importance_value = None
-    if importance_value is not None and importance_value < 0.05:
+    if importance_value is not None and importance_value < MIN_GEOCODE_IMPORTANCE_THRESHOLD:
         return False
 
     query_tokens = _tokenize_geocode_text(query_text)
@@ -602,7 +609,7 @@ async def geocode_listings(olx_pipeline_config: OLXPipelineConfig) -> dict[str, 
     rows_marked_not_found = 0
     semaphore = asyncio.Semaphore(1)
 
-    async with httpx.AsyncClient(headers=NOMINATIM_HEADERS, timeout=30.0) as client:
+    async with httpx.AsyncClient(headers=NOMINATIM_HEADERS, timeout=NOMINATIM_TIMEOUT_SECONDS) as client:
         connection = await asyncpg.connect(olx_pipeline_config.postgres_dsn)
         try:
             for candidate in candidates:
