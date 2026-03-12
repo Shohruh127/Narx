@@ -77,7 +77,7 @@ UPDATE_NEAREST_METRO_METERS_QUERY = """
     FROM LATERAL (
         SELECT ROUND(ST_DistanceSphere(listings.location, metro.location))::integer AS distance_meters
         FROM tashkent_metro_stations AS metro
-        ORDER BY listings.location <-> metro.location, metro.id
+        ORDER BY ST_DistanceSphere(listings.location, metro.location), metro.id
         LIMIT 1
     ) AS nearest_metro
     WHERE listings.location IS NOT NULL

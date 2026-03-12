@@ -325,7 +325,7 @@ def test_fetch_geocode_candidates_reads_only_active_olx_rows_without_location(mo
     assert executed["closed"] is True
 
 
-def test_fetch_tashkent_metro_stations_uses_overpass_query_and_filters_invalid_rows() -> None:
+def test_fetch_tashkent_metro_stations_filters_invalid_rows() -> None:
     requests: list[httpx.Request] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -496,7 +496,7 @@ def test_update_listing_geocode_and_not_found_use_expected_queries() -> None:
     assert executed[1][1] == ("listing-2",)
 
 
-def test_update_listings_nearest_metro_meters_uses_distance_sphere(monkeypatch) -> None:
+def test_update_listings_nearest_metro_meters_calculates_distances(monkeypatch) -> None:
     executed: dict[str, object] = {}
 
     class FakeConnection:
@@ -651,7 +651,9 @@ def test_update_listings_nearest_metro_asset_returns_updated_rows(monkeypatch) -
 
 
 def test_sql_schema_includes_tashkent_metro_table_and_nearest_metro_column() -> None:
-    schema_sql = Path("/home/runner/work/Narx/Narx/sql/listings_exchange_rates.sql").read_text(encoding="utf-8")
+    schema_sql = (
+        Path(__file__).resolve().parents[1] / "sql" / "listings_exchange_rates.sql"
+    ).read_text(encoding="utf-8")
 
     assert "CREATE TABLE tashkent_metro_stations" in schema_sql
     assert "nearest_metro_meters integer" in schema_sql
